@@ -1,0 +1,354 @@
+from scripts.database import Database
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import pandas as pd
+
+
+class CLVPotential:
+    """A reorganized implementation for computing customers' CLV potential."""
+
+    def _init_(self) -> None:
+        self._db = Database()
+
+    # -------------------- AOV / spending trend --------------------
+    def compute_aov_trend(self, cust_id: str) -> Dict[str, Any]:
+        """Compute spending trend by splitting a customer's transactions into two periods.
+
+        Returns keys: current_aov, initial_aov, trend_score (0-100), growth_pct
+        """
+        sql = (
+            "SELECT transaction_id, total_amount, transaction_date "
+            "FROM store_sales_header "
+            "WHERE customer_id = ? "
+            "ORDER BY transaction_date ASC;"
+        )
+
+        rows = self._db.execute_query(sql, (cust_id,), fetch=True) or []
+
+        if len(rows) < 2:
+            return {"current_aov": 0.0, "initial_aov": 0.0, "trend_score": 0, "growth_pct": 0.0}
+
+        mid = len(rows) // 2
+        first_block = rows[:mid]
+        second_block = rows[mid:]
+
+        first_avg = sum(r["total_amount"] for r in first_block) / len(first_block)
+        second_avg = sum(r["total_amount"] for r in second_block) / len(second_block)
+
+        if first_avg > 0:
+            growth = (second_avg - first_avg) / first_avg * 100.0
+        else:
+            growth = 0.0
+
+        # Map growth to a 0-100 score with a different bucketing logic than original
+        if growth >= 60:
+            score = 100
+        elif growth >= 25:
+            score = 80
+        elif growth > 0:
+            score = 65
+        elif growth >= -15:
+            score = 45
+        else:
+            score = 25
+
+        return {
+            "current_aov": round(second_avg, 2),
+            "initial_aov": round(first_avg, 2),
+            "trend_score": score,
+            "growth_pct": round(growth, 2),
+        }
+
+    # -------------------- Engagement / frequency & recency --------------------
+    def compute_engagement(self, cust_id: str) -> Dict[str, Any]:
+        """Compute frequency, recency (in days) and an engagement score (0-100).
+
+        Returns: frequency, recency_days, monthly_rate, engagement_score
+        """
+        sql = (
+            "SELECT COUNT(*) AS cnt, MAX(transaction_date) AS last_tx, "
+            "MIN(transaction_date) AS first_tx, customer_since "
+            "FROM store_sales_header sh "
+            "JOIN customer_details cd ON sh.customer_id = cd.customer_id "
+            "WHERE sh.customer_id = ? "
+            "GROUP BY cd.customer_since;"
+        )
+
+        result = self._db.execute_query(sql, (cust_id,), fetch=True) or []
+        if not result:
+            return {"frequency": 0, "recency_days": 999, "monthly_rate": 0.0, "engagement_score": 0}
+
+        row = result[0]
+        freq = int(row.get("cnt", 0))
+
+        # recency
+        try:
+            last_dt = pd.to_datetime(row.get("last_tx"))
+            recency_days = (datetime.now() - last_dt.to_pydatetime()).days
+        except Exception:
+            recency_days = 999
+
+        # monthly purchase rate
+        try:
+            cust_since = pd.to_datetime(row.get("customer_since"))
+            tenure_days = max((datetime.now() - cust_since.to_pydatetime()).days, 1)
+            monthly_rate = (freq / tenure_days) * 30.0
+        except Exception:
+            monthly_rate = 0.0
+
+        # frequency contribution (cap 55 points)
+        freq_pts = min(freq * 9, 55)
+
+        # recency contribution (cap 45 points) - finer buckets
+        if recency_days <= 7:
+            recency_pts = 45
+        elif recency_days <= 30:
+            recency_pts = 36
+        elif recency_days <= 60:
+            recency_pts = 27
+        elif recency_days <= 120:
+            recency_pts = 18
+        else:
+            recency_pts = 9
+
+        engagement_score = int(min(freq_pts + recency_pts, 100))
+
+        return {
+            "frequency": freq,
+            "recency_days": recency_days,
+            "monthly_rate": round(monthly_rate, 2),
+            "engagement_score": engagement_score,
+        }
+
+    # -------------------- Product diversity / breadth --------------------
+    def compute_diversity(self, cust_id: str) -> Dict[str, Any]:
+        """Measure how many unique products and categories a customer purchased.
+
+        Returns: unique_skus, unique_cats, breadth_score (0-100), cat_per_sku_ratio
+        """
+        sql = (
+            "SELECT DISTINCT p.product_id AS sku, p.category AS cat "
+            "FROM store_sales_line_items sli "
+            "JOIN store_sales_header sh ON sli.transaction_id = sh.transaction_id "
+            "JOIN products p ON sli.product_id = p.product_id "
+            "WHERE sh.customer_id = ?;"
+        )
+
+        rows = self._db.execute_query(sql, (cust_id,), fetch=True) or []
+        if not rows:
+            return {"unique_skus": 0, "unique_cats": 0, "breadth_score": 0, "cat_per_sku": 0.0}
+
+        unique_skus = len(rows)
+        unique_cats = len({r["cat"] for r in rows})
+
+        cat_per_sku = (unique_cats / unique_skus) if unique_skus > 0 else 0.0
+
+        # Compose a breadth score with different scaling
+        cat_component = min(unique_cats * 14, 62)  # up to 62 points
+        sku_component = min(unique_skus * 2.5, 38)  # up to 38 points
+        breadth = int(min(cat_component + sku_component, 100))
+
+        return {
+            "unique_skus": unique_skus,
+            "unique_cats": unique_cats,
+            "breadth_score": breadth,
+            "cat_per_sku": round(cat_per_sku, 2),
+        }
+
+    # -------------------- Aggregate CLV potential --------------------
+    def aggregate_clv_score(self, cust_id: str) -> Dict[str, Any]:
+        """Combine the three modules into one CLV potential record."""
+        aov = self.compute_aov_trend(cust_id)
+        eng = self.compute_engagement(cust_id)
+        div = self.compute_diversity(cust_id)
+
+        # weights
+        w_aov, w_eng, w_div = 0.35, 0.40, 0.25
+
+        score = (
+            aov["trend_score"] * w_aov + eng["engagement_score"] * w_eng + div["breadth_score"] * w_div
+        )
+
+        if score >= 80:
+            category = "HIGH"
+        elif score >= 60:
+            category = "MEDIUM-HIGH"
+        elif score >= 40:
+            category = "MEDIUM"
+        else:
+            category = "LOW"
+
+        return {
+            "customer_id": cust_id,
+            "clv_potential_score": round(score, 2),
+            "potential_category": category,
+
+            # AOV fields
+            "current_aov": aov.get("current_aov", 0.0),
+            "aov_growth_pct": aov.get("growth_pct", 0.0),
+            "aov_trend_score": aov.get("trend_score", 0),
+
+            # Engagement fields
+            "purchase_frequency": eng.get("frequency", 0),
+            "recency_days": eng.get("recency_days", 999),
+            "monthly_purchase_rate": eng.get("monthly_rate", 0.0),
+            "engagement_score": eng.get("engagement_score", 0),
+
+            # Diversity fields
+            "unique_products": div.get("unique_skus", 0),
+            "unique_categories": div.get("unique_cats", 0),
+            "category_per_product": div.get("cat_per_sku", 0.0),
+            "breadth_score": div.get("breadth_score", 0),
+        }
+
+    # -------------------- Batch processing & persistence --------------------
+    def process_all(self) -> List[Dict[str, Any]]:
+        """Compute CLV potential for every customer who has transactions."""
+        print("\n" + "=" * 70)
+        print("Running CLV potential computation for all customers...")
+        print("=" * 70)
+
+        sql = "SELECT DISTINCT customer_id FROM store_sales_header WHERE customer_id IS NOT NULL AND customer_id != '';"
+        rows = self._db.execute_query(sql, fetch=True) or []
+
+        if not rows:
+            print("No customers to process.")
+            return []
+
+        print(f"Found {len(rows)} customers. Computing...")
+
+        results: List[Dict[str, Any]] = []
+        for r in rows:
+            cust = r["customer_id"]
+            rec = self.aggregate_clv_score(cust)
+            results.append(rec)
+
+        # sort descending
+        results.sort(key=lambda x: x["clv_potential_score"], reverse=True)
+        print(f"Computed CLV for {len(results)} customers.")
+        return results
+
+    def persist_scores(self, records: List[Dict[str, Any]]) -> None:
+        """Save computed CLV records into a dedicated table (creates if absent).
+
+        Existing contents are replaced to keep table current.
+        """
+        print("Saving CLV results to database...")
+        create_sql = (
+            "CREATE TABLE IF NOT EXISTS clv_potential_scores ("
+            "customer_id VARCHAR(20) PRIMARY KEY, "
+            "clv_potential_score DECIMAL(5,2), potential_category VARCHAR(20), "
+            "current_aov DECIMAL(10,2), aov_growth_pct DECIMAL(6,2), aov_trend_score INT, "
+            "purchase_frequency INT, recency_days INT, monthly_purchase_rate DECIMAL(6,2), "
+            "engagement_score INT, unique_products INT, unique_categories INT, "
+            "category_per_product DECIMAL(4,2), breadth_score INT, calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
+
+        self._db.execute_query(create_sql)
+        self._db.execute_query("DELETE FROM clv_potential_scores;")
+
+        insert_sql = (
+            "INSERT INTO clv_potential_scores (customer_id, clv_potential_score, potential_category, "
+            "current_aov, aov_growth_pct, aov_trend_score, purchase_frequency, recency_days, "
+            "monthly_purchase_rate, engagement_score, unique_products, unique_categories, "
+            "category_per_product, breadth_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+        )
+
+        for rec in records:
+            params = (
+                rec["customer_id"],
+                rec["clv_potential_score"],
+                rec["potential_category"],
+                rec["current_aov"],
+                rec["aov_growth_pct"],
+                rec["aov_trend_score"],
+                rec["purchase_frequency"],
+                rec["recency_days"],
+                rec["monthly_purchase_rate"],
+                rec["engagement_score"],
+                rec["unique_products"],
+                rec["unique_categories"],
+                rec["category_per_product"],
+                rec["breadth_score"],
+            )
+            self._db.execute_query(insert_sql, params)
+
+        print(f"Saved {len(records)} rows to clv_potential_scores.")
+
+    # -------------------- Identify emerging (high potential but not yet top spender) --------------------
+    def find_emerging_customers(self, records: List[Dict[str, Any]], threshold: float = 60.0) -> List[Dict[str, Any]]:
+        """Return customers with CLV potential >= threshold who are not flagged as high-spenders.
+
+        The function expects a customer_details.segment_id = 'HS' to mark top spenders.
+        """
+        sql = "SELECT customer_id FROM customer_details WHERE segment_id = 'HS';"
+        hs_rows = self._db.execute_query(sql, fetch=True) or []
+        hs_set = {r["customer_id"] for r in hs_rows}
+
+        emerging = [rec for rec in records if rec["clv_potential_score"] >= threshold and rec["customer_id"] not in hs_set]
+
+        print(f"Found {len(emerging)} emerging customers (score >= {threshold}).")
+
+        if emerging:
+            print("Top candidates:")
+            print("Customer ID       Score   Category   AOV Growth   Frequency")
+            for e in emerging[:10]:
+                print(f"{e['customer_id']:<17} {e['clv_potential_score']:<6} {e['potential_category']:<10} {e['aov_growth_pct']:<10}% {e['purchase_frequency']}")
+
+        return emerging
+
+    # -------------------- Reporting --------------------
+    def summary_report(self, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            print("No CLV records to report.")
+            return
+
+        totals = len(records)
+        bucket_counts = {}
+        for r in records:
+            bucket_counts[r["potential_category"]] = bucket_counts.get(r["potential_category"], 0) + 1
+
+        print("\nCLV Potential Distribution:")
+        for b, cnt in sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True):
+            pct = cnt / totals * 100
+            print(f"  {b:<12} {cnt:>4} customers  ({pct:5.1f}%)")
+
+        avg_score = sum(r["clv_potential_score"] for r in records) / totals
+        avg_growth = sum(r.get("aov_growth_pct", 0) for r in records) / totals
+        avg_freq = sum(r.get("purchase_frequency", 0) for r in records) / totals
+        avg_cats = sum(r.get("unique_categories", 0) for r in records) / totals
+
+        print("\nAverage statistics:")
+        print(f"  Average CLV Score: {avg_score:.1f}")
+        print(f"  Average AOV Growth: {avg_growth:.1f}%")
+        print(f"  Average Frequency: {avg_freq:.1f}")
+        print(f"  Average Categories: {avg_cats:.1f}")
+
+        print("\nTop 5 by CLV potential:")
+        print("Customer ID     Score   Category   AOV Growth   Engagement")
+        for top in records[:5]:
+            print(f"{top['customer_id']:<15} {top['clv_potential_score']:<6} {top['potential_category']:<10} {top.get('aov_growth_pct', 0):<10}% {top.get('engagement_score', 0)}")
+
+    # -------------------- Runner --------------------
+    def run(self) -> None:
+        try:
+            all_records = self.process_all()
+            if not all_records:
+                return
+
+            self.persist_scores(all_records)
+            emerging = self.find_emerging_customers(all_records)
+            self.summary_report(all_records)
+
+            print("\nCLV potential processing finished successfully.")
+
+        except Exception as exc:
+            print(f"An error occurred while computing CLV potential: {exc}")
+            raise
+
+        finally:
+            self._db.disconnect()
+
+
+if _name_ == '_main_':
+    engine = CLVPotential()
+    engine.run()
