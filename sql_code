@@ -1,0 +1,10 @@
+/*update the customer's total points balance in the customer_details table*/
+
+UPDATE customer_details cd
+SET loyalty_point_balance =
+    COALESCE(cd.loyalty_point_balance, 0) + lp.accrued_points
+FROM loyalty_transactions lp
+WHERE lp.invoice_no = :invoice_no
+  AND cd.customer_id = lp.customer_id;
+
+
