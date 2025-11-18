@@ -1,0 +1,375 @@
+# Paste into Colab — pipeline with Good/Bad split
+!pip install -q pandas numpy matplotlib seaborn scipy scikit-learn statsmodels joblib sqlalchemy psycopg2-binary
+
+import os, sys, json, shutil, re
+from datetime import datetime
+import pandas as pd, numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set(style="whitegrid", rc={"figure.figsize": (8,5)})
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
+import joblib
+from sqlalchemy import create_engine
+try:
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+except Exception:
+    variance_inflation_factor = None
+
+# --------------------------
+# (Reuse helper functions from previous cell)
+# For brevity I include the key helpers only — they are same as your pipeline above.
+# --------------------------
+def load_data_auto(preferred_path="/mnt/data/retail_data_Source.csv", sheet_name=None):
+    try:
+        from google.colab import files
+    except Exception:
+        files = None
+    path = None
+    if preferred_path and os.path.exists(preferred_path):
+        path = preferred_path
+    elif os.path.exists("retail_data_Source.csv"):
+        path = "retail_data_Source.csv"
+    elif os.path.exists("/content/retail_data_Source.csv"):
+        path = "/content/retail_data_Source.csv"
+    else:
+        if files is None:
+            raise FileNotFoundError("File not found in default locations and `google.colab.files` unavailable.")
+        print("File not found in default locations. Please upload your dataset now (CSV / Excel / JSON / Parquet).")
+        uploaded = files.upload()
+        if len(uploaded) == 0:
+            raise FileNotFoundError("No file uploaded.")
+        path = list(uploaded.keys())[0]
+    print("Loading file:", path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return pd.read_csv(path, low_memory=False)
+    if ext in (".xls", ".xlsx"):
+        return pd.read_excel(path, sheet_name=sheet_name)
+    if ext == ".json":
+        try:
+            return pd.read_json(path, lines=True)
+        except:
+            return pd.read_json(path, lines=False)
+    if ext == ".parquet":
+        return pd.read_parquet(path)
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except Exception as e:
+        raise ValueError(f"Unable to read file {path}: {e}")
+
+def make_output_dir(base_name="eda_output"):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = f"/content/{base_name}_{ts}"
+    os.makedirs(out, exist_ok=True)
+    return out
+
+def standardize_column_names(df):
+    def clean(name):
+        if not isinstance(name, str):
+            name = str(name)
+        name = name.strip().lower()
+        name = re.sub(r'[^0-9a-z]+', '_', name)
+        name = re.sub(r'_+', '_', name).strip('_')
+        return name
+    df.columns = [clean(c) for c in df.columns]
+    return df
+
+def smart_mark_duplicates(df):
+    id_like = [c for c in df.columns if re.search(r'id$|^id$|invoice|order_no|order|orderid|transaction', c)]
+    if id_like:
+        for col in id_like:
+            if df[col].notna().sum() > 0:
+                df['_is_duplicate'] = df.duplicated(subset=[col], keep=False)
+                return df, f"marked_duplicates_by_{col}", int(df['_is_duplicate'].sum())
+    df['_is_duplicate'] = df.duplicated(keep=False)
+    return df, "marked_exact_row_duplicates", int(df['_is_duplicate'].sum())
+
+# The imputation/processing function (same logic as earlier, returns full preprocessed df and artifact)
+def preprocess_and_save_pipeline(df, outdir, mandatory_normalize=True):
+    df_work = df.copy()
+    # create missing indicators
+    for c in df_work.columns:
+        df_work[f"{c}_was_missing"] = df_work[c].isnull().astype(int)
+
+    # identify types
+    cat_cols = df_work.select_dtypes(include=['object','category']).columns.tolist()
+    cat_cols = [c for c in cat_cols if not c.endswith("_was_missing")]
+    num_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = [c for c in num_cols if not c.endswith("_was_missing") and c != '_is_duplicate']
+
+    # bool -> int
+    bool_cols = df_work.select_dtypes(include=['bool']).columns.tolist()
+    for c in bool_cols:
+        df_work[c] = df_work[c].astype(int)
+        if c not in num_cols:
+            num_cols.append(c)
+
+    # coerce numeric-like object cols (create new coerced cols)
+    coerced = []
+    for c in list(cat_cols):
+        sample = df_work[c].dropna().astype(str).head(500).tolist()
+        numeric_like = sum(1 for v in sample if re.fullmatch(r'[-+]?\d+(\.\d+)?', v)) / max(1, len(sample))
+        if numeric_like > 0.8:
+            newc = c + "_coerced_num"
+            df_work[newc] = pd.to_numeric(df_work[c], errors='coerce')
+            coerced.append(newc)
+            num_cols.append(newc)
+
+    # impute numeric with median
+    for c in num_cols:
+        try:
+            med = float(pd.Series(df_work[c]).median(skipna=True))
+            df_work[c + "_imputed"] = df_work[c].fillna(med)
+        except Exception:
+            df_work[c + "_imputed"] = df_work[c].fillna(0)
+
+    # impute categorical with placeholder
+    cat_cols = df_work.select_dtypes(include=['object','category']).columns.tolist()
+    cat_cols = [c for c in cat_cols if not c.endswith("_was_missing")]
+    for c in cat_cols:
+        df_work[c + "_imputed"] = df_work[c].fillna("<<MISSING>>").astype(str).str.strip().replace({'nan':'<<MISSING>>'})
+
+    # scalers + encoders on imputed cols
+    numeric_imputed_cols = [c for c in df_work.columns if c.endswith("_imputed") and pd.api.types.is_numeric_dtype(df_work[c])]
+    categorical_imputed_cols = [c for c in df_work.columns if c.endswith("_imputed") and not pd.api.types.is_numeric_dtype(df_work[c])]
+
+    numeric_transformer_mm = MinMaxScaler()
+    numeric_transformer_std = StandardScaler()
+    if numeric_imputed_cols and mandatory_normalize:
+        X_num = df_work[numeric_imputed_cols].fillna(0).values
+        numeric_transformer_mm.fit(X_num)
+        numeric_transformer_std.fit(X_num)
+
+    label_encoders = {}
+    for c in categorical_imputed_cols:
+        base = c.replace("_imputed","")
+        le = LabelEncoder()
+        try:
+            le.fit(df_work[c].astype(str))
+            label_encoders[base] = le
+        except Exception:
+            uniques = list(pd.Series(df_work[c].astype(str).unique()))
+            mapping = {v:i for i,v in enumerate(uniques)}
+            class SimpleLE:
+                def __init__(self,mapping): self.mapping=mapping
+                def transform(self, arr): return np.array([self.mapping.get(str(x), -1) for x in arr], dtype=int)
+                def fit(self, arr): pass
+            label_encoders[base] = SimpleLE(mapping)
+
+    # apply numeric scaling
+    for col in numeric_imputed_cols:
+        try:
+            col_vals = df_work[[col]].fillna(0).values
+            if mandatory_normalize:
+                mm = numeric_transformer_mm.transform(col_vals).reshape(-1,)
+                zsc = numeric_transformer_std.transform(col_vals).reshape(-1,)
+                base = col.replace("_imputed","")
+                df_work[base + "_minmax"] = mm
+                df_work[base + "_zsc"] = zsc
+        except Exception as e:
+            print(f"Warning scaling {col}: {e}")
+
+    # apply categorical encodings
+    for base, le in label_encoders.items():
+        imputed_col = base + "_imputed"
+        try:
+            df_work[base + "_le"] = le.transform(df_work[imputed_col].astype(str))
+        except Exception:
+            df_work[base + "_le"] = pd.factorize(df_work[imputed_col].astype(str))[0]
+
+    preprocess_artifact = {
+        "numeric_imputed_columns": numeric_imputed_cols,
+        "categorical_imputed_columns": categorical_imputed_cols,
+        "minmax_scaler": numeric_transformer_mm if numeric_imputed_cols else None,
+        "zscore_scaler": numeric_transformer_std if numeric_imputed_cols else None,
+        "label_encoders": {k: (list(v.classes_) if hasattr(v,"classes_") else getattr(v,"mapping", "<custom>")) for k,v in label_encoders.items()}
+    }
+    joblib.dump(preprocess_artifact, os.path.join(outdir, "preprocess_pipeline.pkl"))
+
+    df_work.to_csv(os.path.join(outdir, "preprocessed_full.csv"), index=False)
+    return df_work, preprocess_artifact
+
+# EDA helpers (same as before) - omitted here for brevity (assume present in the notebook)
+def save_basic_info(df, outdir):
+    info = {
+        "shape": df.shape,
+        "columns": df.columns.tolist(),
+        "dtypes": df.dtypes.apply(lambda x:str(x)).to_dict(),
+        "memory_bytes": int(df.memory_usage(deep=True).sum())
+    }
+    with open(os.path.join(outdir, "basic_info.json"), "w") as f:
+        json.dump(info, f, indent=2)
+
+def missing_and_duplicates_report(df, outdir):
+    miss = df.isnull().sum().sort_values(ascending=False)
+    miss_pct = (df.isnull().mean()*100).sort_values(ascending=False)
+    missing_df = pd.concat([miss, miss_pct], axis=1)
+    missing_df.columns = ["missing_count", "missing_percent"]
+    missing_df.to_csv(os.path.join(outdir, "missing_report.csv"))
+    try:
+        sample = df if df.shape[0] <= 2000 else df.sample(2000, random_state=1)
+        plt.figure(figsize=(12,5))
+        sns.heatmap(sample.isnull(), cbar=False)
+        plt.title("Missing values map (sampled)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "missing_heatmap.png"))
+        plt.close()
+    except Exception as e:
+        print("Heatmap warning:", e)
+    dup_count = int(df.duplicated().sum())
+    with open(os.path.join(outdir, "duplicates_count.txt"), "w") as f:
+        f.write(str(dup_count))
+    return missing_df, dup_count
+
+def univariate_plots(df, outdir, max_unique_cat=50):
+    os.makedirs(os.path.join(outdir, "univariate"), exist_ok=True)
+    for col in df.columns:
+        try:
+            ser = df[col]
+            fname = os.path.join(outdir, "univariate", f"{col}_univariate.png")
+            plt.figure(figsize=(8,4))
+            if pd.api.types.is_numeric_dtype(ser):
+                ser.dropna().hist(bins=30)
+                plt.title(f"{col} (numeric) — histogram")
+            else:
+                vc = ser.fillna("<<MISSING>>").value_counts()
+                if vc.shape[0] <= max_unique_cat:
+                    vc.plot(kind="bar")
+                    plt.title(f"{col} (categorical) — counts")
+                else:
+                    vc.head(30).plot(kind="bar")
+                    plt.title(f"{col} (categorical) — top 30 counts")
+                plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(fname)
+            plt.close()
+        except Exception:
+            pass
+
+def bivariate_plots(df, outdir):
+    os.makedirs(os.path.join(outdir, "bivariate"), exist_ok=True)
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if len(num_cols) < 2:
+        return
+    corr = df[num_cols].corr().abs().unstack().reset_index()
+    corr.columns = ["x","y","corr"]
+    corr = corr[corr['x']!=corr['y']].sort_values("corr", ascending=False).drop_duplicates(subset=['corr'])
+    for _, row in corr.head(6).iterrows():
+        x,y = row['x'], row['y']
+        try:
+            sample = df[[x,y]].dropna()
+            if sample.shape[0] > 5000:
+                sample = sample.sample(5000, random_state=1)
+            plt.figure(figsize=(6,4))
+            sns.scatterplot(x=sample[x], y=sample[y], alpha=0.5)
+            plt.title(f"{x} vs {y} (corr={row['corr']:.2f})")
+            plt.tight_layout()
+            plt.savefig(os.path.join(outdir, "bivariate", f"{x}_vs_{y}.png"))
+            plt.close()
+        except Exception:
+            pass
+
+# --------------------------
+# Runner + Good/Bad split logic
+# --------------------------
+outdir = make_output_dir()
+print("Output directory:", outdir)
+
+# Load
+try:
+    df = load_data_auto(preferred_path="/mnt/data/retail_data_Source.csv")
+except Exception as e:
+    print("Auto-load failed:", e)
+    df = load_data_auto(preferred_path=None)
+
+print("Initial shape:", df.shape)
+
+df = standardize_column_names(df)
+save_basic_info(df, outdir)
+missing_df_before, dup_before = missing_and_duplicates_report(df, outdir)
+
+# mark duplicates (keep rows)
+df_marked, dedup_method, n_marked_dup = smart_mark_duplicates(df)
+print(f"Duplicates marked: {n_marked_dup} using {dedup_method}")
+
+# preprocess (impute/encode/scale) — rows preserved
+df_preprocessed, preprocess_artifact = preprocess_and_save_pipeline(df_marked, outdir)
+
+# Now: determine good vs bad rows
+# User-configurable thresholds
+missing_row_threshold = 0.5      # if >50% values missing in original columns => bad
+mark_duplicates_as_bad = False  # if True, any row with _is_duplicate==True will be bad
+require_critical_cols = []      # e.g. ["customer_id","invoice_no"] - if missing -> bad
+
+# compute per-row missing fraction considering original columns only (exclude indicator cols and any generated columns)
+orig_cols = [c for c in df_marked.columns if not c.endswith("_was_missing")]
+# avoid including preprocessed generated columns — orig df_marked contains original set + _is_duplicate only
+def row_missing_fraction(row, cols):
+    return row[cols].isnull().sum() / max(1, len(cols))
+
+missing_frac = df_marked.apply(lambda r: row_missing_fraction(r, orig_cols), axis=1)
+df_preprocessed['_missing_fraction_original'] = missing_frac
+
+# critical columns check
+if require_critical_cols:
+    missing_critical = df_marked[require_critical_cols].isnull().any(axis=1)
+    df_preprocessed['_missing_critical'] = missing_critical.astype(int)
+else:
+    df_preprocessed['_missing_critical'] = 0
+
+# duplicate flag (already present as _is_duplicate True/False)
+df_preprocessed['_is_duplicate'] = df_preprocessed.get('_is_duplicate', False)
+
+# Compose bad mask
+bad_mask = (df_preprocessed['_missing_fraction_original'] > missing_row_threshold) | (df_preprocessed['_missing_critical'] == 1)
+if mark_duplicates_as_bad:
+    bad_mask = bad_mask | (df_preprocessed['_is_duplicate'].astype(bool))
+
+# Create good / bad splits
+df_bad = df_preprocessed[bad_mask].copy()
+df_good = df_preprocessed[~bad_mask].copy()
+
+# Save outputs (full preprocessed + good + bad)
+final_path = "/content/preprocessed_final.csv"
+df_preprocessed.to_csv(final_path, index=False)
+good_path = "/content/good_data.csv"
+bad_path = "/content/bad_data.csv"
+df_good.to_csv(good_path, index=False)
+df_bad.to_csv(bad_path, index=False)
+
+print("Saved:")
+print(" - full preprocessed:", final_path, " rows:", df_preprocessed.shape[0])
+print(" - GOOD (safe)      :", good_path, " rows:", df_good.shape[0])
+print(" - BAD  (review)    :", bad_path, " rows:", df_bad.shape[0])
+
+# Save short summary
+summary_lines = [
+    f"Original shape: {df.shape}",
+    f"Duplicates marked (no deletion): {dedup_method}, count_marked: {int(n_marked_dup)}",
+    f"Preprocessed shape (rows preserved): {df_preprocessed.shape}",
+    f"Rows flagged BAD (criteria missing_fraction>{missing_row_threshold} or missing critical): {df_bad.shape[0]}",
+    f"Rows considered GOOD: {df_good.shape[0]}"
+]
+with open(os.path.join(outdir, "good_bad_summary.txt"), "w") as f:
+    f.write("\n".join(summary_lines))
+print("\n".join(summary_lines))
+
+# Optional: push GOOD & BAD to DB if SQLALCHEMY_DATABASE_URI provided
+db_uri = os.environ.get("SQLALCHEMY_DATABASE_URI")
+good_table = os.environ.get("GOOD_TABLE", "preprocessed_good")
+bad_table  = os.environ.get("BAD_TABLE",  "preprocessed_bad")
+if db_uri:
+    try:
+        engine = create_engine(db_uri)
+        chunksize = int(os.environ.get("DB_CHUNKSIZE", 5000))
+        df_good.to_sql(name=good_table, con=engine, if_exists='replace', index=False, chunksize=chunksize, method='multi')
+        df_bad.to_sql(name=bad_table, con=engine, if_exists='replace', index=False, chunksize=chunksize, method='multi')
+        print(f"Pushed GOOD -> {good_table}, BAD -> {bad_table}")
+    except Exception as e:
+        print("DB upload failed:", e)
+        print("CSV paths are available for bulk LOAD (recommended).")
+
+print("Output dir files:", sorted(os.listdir(outdir)))
