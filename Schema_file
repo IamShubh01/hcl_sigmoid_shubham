@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+etl_dynamic.py
+
+Dynamic ETL pipeline:
+- Automatically processes known CSV files (configurable)
+- Validates rows using DataValidator
+- Loads good records to DB (or local CSVs when dry-run / DB unavailable)
+- Persists bad records to bad-data CSVs for debugging
+- CLI: choose data directory, run only some entities, dry-run, set output dir
+"""
+
+from __future__ import annotations
+import pandas as pd
+import re
+import argparse
+from datetime import datetime
+from typing import Tuple, Dict, List, Any, Callable
+from pathlib import Path
+import sys
+import math
+
+# Replace this import with your real Database module
+from scripts.database import Database
+
+
+class DataValidator:
+    """Data quality validation rules"""
+
+    @staticmethod
+    def is_valid_email(email: Any) -> bool:
+        if pd.isna(email) or email is None:
+            return False
+        s = str(email).strip()
+        if s == '' or s.upper() == 'NULL':
+            return False
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(pattern, s))
+
+    @staticmethod
+    def is_valid_phone(phone: Any) -> bool:
+        if pd.isna(phone) or phone is None:
+            return False
+        s = str(phone).strip()
+        if s == '' or s.upper() == 'NULL':
+            return False
+        # Accept digits and optional leading '+'; you can refine to country-specific formats
+        s_digits = s.lstrip('+')
+        return len(s_digits) >= 10 and s_digits.isdigit()
+
+    @staticmethod
+    def is_valid_date(date_str: Any) -> bool:
+        if pd.isna(date_str) or date_str is None:
+            return False
+        s = str(date_str).strip()
+        if s == '' or s.upper() == 'NULL':
+            return False
+        try:
+            pd.to_datetime(s, utc=False)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_valid_numeric(value: Any, allow_negative: bool = False) -> bool:
+        if pd.isna(value) or value is None:
+            return False
+        s = str(value).strip()
+        if s == '' or s.upper() == 'NULL':
+            return False
+        try:
+            num = float(s)
+            if not allow_negative and num < 0:
+                return False
+            if math.isfinite(num):
+                return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_not_null(value: Any) -> bool:
+        if pd.isna(value) or value is None:
+            return False
+        s = str(value).strip().upper()
+        return s != '' and s != 'NULL' and s != 'NONE'
+
+
+class ETLPipeline:
+    """Main ETL Pipeline for data ingestion and processing"""
+
+    # Define what files/entities we support and which validator method to call.
+    # key: entity name, value: spec dict with 'file', 'validator' callable and table names
+    ENTITY_SPECS: Dict[str, Dict[str, Any]] = {
+        'stores': {
+            'file': 'stores.csv',
+            'validator': 'validate_stores',
+            'table': 'stores',
+            'bad_table': 'bad_data_stores'
+        },
+        'products': {
+            'file': 'products.csv',
+            'validator': 'validate_products',
+            'table': 'products',
+            'bad_table': 'bad_data_products'
+        },
+        'customers': {
+            'file': 'customer_details.csv',
+            'validator': 'validate_customers',
+            'table': 'customer_details',
+            'bad_table': 'bad_data_customers'
+        },
+        'promotions': {
+            'file': 'promotion_details.csv',
+            'validator': 'validate_promotions',
+            'table': 'promotion_details',
+            'bad_table': 'bad_data_promotions'
+        },
+        'loyalty_rules': {
+            'file': 'loyalty_rules.csv',
+            'validator': 'validate_loyalty_rules',
+            'table': 'loyalty_rules',
+            'bad_table': 'bad_data_loyalty_rules'
+        },
+        'sales_header': {
+            'file': 'store_sales_header.csv',
+            'validator': 'validate_sales_header',
+            'table': 'store_sales_header',
+            'bad_table': 'bad_data_sales_header'
+        },
+        'sales_line_items': {
+            'file': 'store_sales_line_items.csv',
+            'validator': 'validate_sales_line_items',
+            'table': 'store_sales_line_items',
+            'bad_table': 'bad_data_sales_line_items'
+        }
+    }
+
+    def __init__(self, data_dir: str = "data/raw_data", dry_run: bool = True, out_dir: str = "data/etl_output"):
+        self.data_dir = Path(data_dir)
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database()  # your Database class must provide connect() and disconnect()
+        self.validator = DataValidator()
+        # initialize stats based on entity keys
+        self.stats: Dict[str, Dict[str, int]] = {
+            name: {'good': 0, 'bad': 0} for name in self.ENTITY_SPECS.keys()
+        }
+        self.dry_run = dry_run
+
+    # -------------------------
+    # Validation functions
+    # -------------------------
+    def validate_stores(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('store_id')):
+                reasons.append("Missing store_id")
+            if not self.validator.is_not_null(row.get('store_name')):
+                reasons.append("Missing store_name")
+            if not self.validator.is_not_null(row.get('store_city')):
+                reasons.append("Missing store_city")
+            if not self.validator.is_not_null(row.get('store_region')):
+                reasons.append("Missing store_region")
+            if not self.validator.is_valid_date(row.get('opening_date')):
+                reasons.append("Invalid opening_date")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'stores.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_products(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('product_id')):
+                reasons.append("Missing product_id")
+            if not self.validator.is_not_null(row.get('product_name')):
+                reasons.append("Missing product_name")
+            if not self.validator.is_not_null(row.get('category')):
+                reasons.append("Missing category")
+            if not self.validator.is_valid_numeric(row.get('unit_price'), allow_negative=False):
+                reasons.append("Invalid or negative unit_price")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'products.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_customers(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('customer_id')):
+                reasons.append("Missing customer_id")
+            if not self.validator.is_not_null(row.get('first_name')):
+                reasons.append("Missing first_name")
+            if not self.validator.is_not_null(row.get('last_name')):
+                reasons.append("Missing last_name")
+            email = row.get('email')
+            if self.validator.is_not_null(email) and not self.validator.is_valid_email(email):
+                reasons.append("Invalid email format")
+            phone = row.get('phone')
+            if self.validator.is_not_null(phone) and not self.validator.is_valid_phone(phone):
+                reasons.append("Invalid phone number")
+            points = row.get('total_loyalty_points')
+            if self.validator.is_not_null(points) and not self.validator.is_valid_numeric(points, allow_negative=False):
+                reasons.append("Invalid loyalty points")
+            if not self.validator.is_valid_date(row.get('customer_since')):
+                reasons.append("Invalid customer_since date")
+            last_purchase = row.get('last_purchase_date')
+            if self.validator.is_not_null(last_purchase) and not self.validator.is_valid_date(last_purchase):
+                reasons.append("Invalid last_purchase_date")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'customer_details.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_promotions(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('promotion_id')):
+                reasons.append("Missing promotion_id")
+            if not self.validator.is_not_null(row.get('promotion_name')):
+                reasons.append("Missing promotion_name")
+            if not self.validator.is_valid_date(row.get('start_date')):
+                reasons.append("Invalid start_date")
+            if not self.validator.is_valid_date(row.get('end_date')):
+                reasons.append("Invalid end_date")
+            if not self.validator.is_valid_numeric(row.get('discount_percentage'), allow_negative=False):
+                reasons.append("Invalid discount_percentage")
+            if not self.validator.is_not_null(row.get('applicable_category')):
+                reasons.append("Missing applicable_category")
+            if (self.validator.is_valid_date(row.get('start_date')) and
+                    self.validator.is_valid_date(row.get('end_date'))):
+                try:
+                    start = pd.to_datetime(row.get('start_date'))
+                    end = pd.to_datetime(row.get('end_date'))
+                    if end < start:
+                        reasons.append("end_date before start_date")
+                except Exception:
+                    pass
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'promotion_details.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_loyalty_rules(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('rule_id')):
+                reasons.append("Missing rule_id")
+            if not self.validator.is_not_null(row.get('rule_name')):
+                reasons.append("Missing rule_name")
+            if not self.validator.is_valid_numeric(row.get('per_unit_spend'), allow_negative=False):
+                reasons.append("Invalid per_unit_spend")
+            if not self.validator.is_valid_numeric(row.get('spend_threshold'), allow_negative=False):
+                reasons.append("Invalid spend_threshold")
+            bonus = row.get('bonus_points')
+            if self.validator.is_not_null(bonus) and not self.validator.is_valid_numeric(bonus, allow_negative=False):
+                reasons.append("Invalid bonus_points")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'loyalty_rules.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_sales_header(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_not_null(row.get('transaction_id')):
+                reasons.append("Missing transaction_id")
+            if not self.validator.is_not_null(row.get('store_id')):
+                reasons.append("Missing store_id")
+            if not self.validator.is_valid_date(row.get('transaction_date')):
+                reasons.append("Invalid transaction_date")
+            if not self.validator.is_valid_numeric(row.get('total_amount'), allow_negative=False):
+                reasons.append("Invalid or negative total_amount")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'store_sales_header.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    def validate_sales_line_items(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        good_data = []
+        bad_data = []
+        for _, row in df.iterrows():
+            reasons = []
+            if not self.validator.is_valid_numeric(row.get('line_item_id'), allow_negative=False):
+                reasons.append("Invalid line_item_id")
+            if not self.validator.is_not_null(row.get('transaction_id')):
+                reasons.append("Missing transaction_id")
+            if not self.validator.is_not_null(row.get('product_id')):
+                reasons.append("Missing product_id")
+            if not self.validator.is_valid_numeric(row.get('quantity'), allow_negative=False):
+                reasons.append("Invalid or negative quantity")
+            else:
+                try:
+                    if float(row.get('quantity')) <= 0:
+                        reasons.append("Quantity must be positive")
+                except Exception:
+                    reasons.append("Quantity not numeric")
+            if not self.validator.is_valid_numeric(row.get('line_item_amount'), allow_negative=False):
+                reasons.append("Invalid or negative line_item_amount")
+            if reasons:
+                bad_record = row.to_dict()
+                bad_record['rejection_reason'] = '; '.join(reasons)
+                bad_record['source_file'] = 'store_sales_line_items.csv'
+                bad_data.append(bad_record)
+            else:
+                good_data.append(row.to_dict())
+        return pd.DataFrame(good_data), pd.DataFrame(bad_data)
+
+    # -------------------------
+    # Loading / persistence
+    # -------------------------
+    def load_to_database(self, good_df: pd.DataFrame, bad_df: pd.DataFrame,
+                         entity: str, table_name: str, bad_table_name: str):
+        """Load good and bad data. If dry_run -> write CSVs to out_dir; otherwise try DB."""
+        # update stats
+        self.stats[entity]['good'] = len(good_df) if good_df is not None else 0
+        self.stats[entity]['bad'] = len(bad_df) if bad_df is not None else 0
+
+        if self.dry_run:
+            # write local CSVs for inspection
+            if not good_df.empty:
+                out_good = self.out_dir / f"{table_name}_good.csv"
+                good_df.to_csv(out_good, mode='a', index=False, header=not out_good.exists())
+                print(f"  ✓ [dry-run] wrote {len(good_df)} good rows to {out_good}")
+            if not bad_df.empty:
+                out_bad = self.out_dir / f"{bad_table_name}.csv"
+                bad_df.to_csv(out_bad, mode='a', index=False, header=not out_bad.exists())
+                print(f"  ⚠ [dry-run] wrote {len(bad_df)} bad rows to {out_bad}")
+            return
+
+        # Attempt DB load
+        try:
+            conn = self.db.connect()
+            if not good_df.empty:
+                # chunked upload to avoid memory/execution issues
+                good_df.to_sql(table_name, conn, if_exists='append', index=False, method='multi', chunksize=1000)
+                print(f"  ✓ Loaded {len(good_df)} good records to {table_name}")
+            if not bad_df.empty:
+                bad_df.to_sql(bad_table_name, conn, if_exists='append', index=False, method='multi', chunksize=1000)
+                print(f"  ⚠ Loaded {len(bad_df)} bad records to {bad_table_name}")
+        except Exception as e:
+            # fallback: write to CSVs and log the DB error
+            print(f"  ❗ DB load failed for {entity}: {e}. Falling back to CSV files.")
+            if not good_df.empty:
+                out_good = self.out_dir / f"{table_name}_good.csv"
+                good_df.to_csv(out_good, mode='a', index=False, header=not out_good.exists())
+                print(f"    [fallback] wrote {len(good_df)} good rows to {out_good}")
+            if not bad_df.empty:
+                out_bad = self.out_dir / f"{bad_table_name}.csv"
+                bad_df.to_csv(out_bad, mode='a', index=False, header=not out_bad.exists())
+                print(f"    [fallback] wrote {len(bad_df)} bad rows to {out_bad}")
+
+    # -------------------------
+    # Processing orchestration
+    # -------------------------
+    def _process_entity(self, entity: str):
+        spec = self.ENTITY_SPECS[entity]
+        file_path = self.data_dir / spec['file']
+        if not file_path.exists():
+            print(f"  ⚠ Skipping {entity}: file {file_path} not found.")
+            return
+
+        print(f"\n📦 Processing {entity} from {file_path.name} ...")
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            print(f"  ❌ Failed to read {file_path}: {e}")
+            return
+
+        validator_fn: Callable[[pd.DataFrame], Tuple[pd.DataFrame, pd.DataFrame]] = getattr(self, spec['validator'])
+        good_df, bad_df = validator_fn(df)
+
+        # Ensure dataframes are not None and have consistent columns
+        if good_df is None:
+            good_df = pd.DataFrame()
+        if bad_df is None:
+            bad_df = pd.DataFrame()
+
+        # Load
+        self.load_to_database(good_df, bad_df, entity, spec['table'], spec['bad_table'])
+
+    def run(self, entities: List[str] | None = None):
+        """Run pipeline for given entities (None => all)"""
+        to_run = entities if entities else list(self.ENTITY_SPECS.keys())
+        start = datetime.now()
+        print("\n" + "=" * 60)
+        print(" STARTING ETL PIPELINE")
+        print("=" * 60)
+        try:
+            for ent in to_run:
+                if ent not in self.ENTITY_SPECS:
+                    print(f"  ⚠ Unknown entity '{ent}' - skipping")
+                    continue
+                self._process_entity(ent)
+
+            # summary
+            print("\n" + "=" * 60)
+            print("📊 ETL PIPELINE SUMMARY")
+            print("=" * 60)
+            for entity, counts in self.stats.items():
+                total = counts['good'] + counts['bad']
+                success_rate = (counts['good'] / total * 100) if total > 0 else 0.0
+                print(f"{entity:20s} | Good: {counts['good']:5d} | Bad: {counts['bad']:5d} | Success: {success_rate:6.1f}%")
+            end = datetime.now()
+            print(f"\n⏱  Total Duration: {(end - start).total_seconds():.2f} seconds")
+            print(" ETL Pipeline finished.")
+        except Exception as e:
+            print(f"\n ETL Pipeline failed: {e}")
+            raise
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Dynamic ETL pipeline")
+    p.add_argument("--data-dir", "-d", default="data/raw_data", help="Directory containing raw CSV files")
+    p.add_argument("--out-dir", "-o", default="data/etl_output", help="Directory for dry-run outputs and bad-data files")
+    p.add_argument("--entities", "-e", nargs="+", help="List of entities to process (default: all). e.g. stores products")
+    p.add_argument("--dry-run", action="store_true", help="Enable dry-run: do NOT write to DB; write CSVs instead")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    etl = ETLPipeline(data_dir=args.data_dir, dry_run=args.dry_run or True, out_dir=args.out_dir)
+    # if entities provided, use them (validate names)
+    ents = args.entities if args.entities else None
+    etl.run(entities=ents)
